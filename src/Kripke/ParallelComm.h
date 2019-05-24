@@ -78,6 +78,7 @@ class ParallelComm {
 
     Kripke::Core::FieldStorage<double> *m_plane_data[3];
 
+  public:
     // These vectors contian the recieve requests
 #ifdef KRIPKE_USE_MPI
     std::vector<MPI_Request> recv_requests;

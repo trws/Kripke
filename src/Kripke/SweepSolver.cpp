@@ -40,6 +40,209 @@
 #include <vector>
 #include <stdio.h>
 
+struct mpi_request_range {
+  mpi_request_range(int n) : requests(n, MPI_REQUEST_NULL) {}
+  mpi_request_range(std::vector<MPI_Request> const &v) : requests(v) {}
+
+  std::vector<MPI_Request> requests;
+  size_t done = 0;
+  int ridx = -1;
+
+  struct end_tag {
+  };
+  struct request_iter {
+  private:
+    void check_first()
+    {
+      // ensure populated on first deref
+      if (range.done < 0) {
+        this->operator++();
+      }
+    }
+
+  public:
+    request_iter(mpi_request_range &ran) : range(ran) {}
+    request_iter &operator++()
+    {
+      range.wait_next();
+      return *this;
+    }
+    std::tuple<MPI_Request *, int> operator*()
+    {
+      return {&range.requests[range.ridx], range.ridx};
+    }
+    MPI_Request *operator->() { return &range.requests[range.ridx]; }
+    bool operator==(const end_tag &)
+    {
+      return range.done == range.requests.size() + 1;
+    }
+    bool operator!=(const end_tag &)
+    {
+      return !(range.done == range.requests.size() + 1);
+    }
+    bool operator==(const request_iter &r) { return &range == &r.range; }
+    bool operator!=(const request_iter &r) { return !(*this == r); }
+
+    mpi_request_range &range;
+  };
+  void wait_next()
+  {
+    if (done > requests.size()) throw;
+    // if (idx > 0) requests[idx] = MPI_REQUEST_NULL;
+    MPI_Status s;
+    MPI_Waitany(requests.size(), requests.data(), &ridx, &s);
+    done++;
+  }
+  int wait_some(RAJA::impl::Span<int *, int> indices,
+                RAJA::impl::Span<MPI_Status *, int> statuses)
+  {
+    if (done > requests.size()) throw;
+    // if (idx > 0) requests[idx] = MPI_REQUEST_NULL;
+    int outcount = indices.size();
+    MPI_Waitsome(requests.size(),
+                 requests.data(),
+                 &outcount,
+                 indices.data(),
+                 statuses.data());
+    done += outcount;
+    return outcount;
+  }
+  int try_some(RAJA::impl::Span<int *, int> indices,
+               RAJA::impl::Span<MPI_Status *, int> statuses)
+  {
+    if (done > requests.size()) throw;
+    // if (idx > 0) requests[idx] = MPI_REQUEST_NULL;
+    int outcount = indices.size();
+    MPI_Testsome(requests.size(),
+                requests.data(),
+                &outcount,
+                indices.data(),
+                statuses.data());
+    done += outcount;
+    return outcount;
+  }
+
+  size_t size() { return requests.size(); }
+  request_iter begin()
+  {
+    if (ridx < 0) {
+      wait_next();
+    }
+    return request_iter(*this);
+  }
+  end_tag end() { return {}; }
+};
+
+template <typename Range, typename Body>
+mpi_request_range make_request_iter(Range &&r, Body &&b)
+{
+  using std::distance;
+  auto dist = distance(r.begin(), r.end());
+
+  using std::begin;
+  auto bit = begin(r);
+  mpi_request_range requests(dist);
+  for (int i = 0; i < dist; ++i) {
+    b(bit[i], requests.requests[i]);
+  }
+  return requests;
+}
+
+template <typename InputRange, typename Body>
+void forall_input(InputRange &&it, Body &&b)
+{
+#pragma omp parallel
+#pragma omp master
+  {
+    for (auto const &r : it) {
+#pragma omp task
+      {
+        b(r);
+      }
+    }
+  }
+}
+
+template <typename InputRange, typename Body, typename Body2>
+void forall_input_funnel(InputRange &&it, Body &&b, Body2 &&funnel_body)
+{
+  // queue of return type of b
+  using ret_type = typename std::result_of<Body(decltype(*it.begin()))>::type;
+  tbb::concurrent_queue<ret_type> q;
+#pragma omp parallel
+#pragma omp master
+  {
+    for (auto const &r : it) {
+#pragma omp task
+      {
+        q.emplace(b(r));
+      }
+      ret_type v;
+      // must process here, just in case we're serialized
+      while (q.try_pop(v)) {
+
+#pragma omp critical
+        std::cout << "got data to send: " << v << std::endl;
+        funnel_body(v);
+// do everything we can to ensure deadlock avoidance
+#pragma omp taskyield
+      }
+    }
+  }
+  // all receives are done at this point
+  while (!q.empty()) {
+    std::cout << "draining queue " << q.unsafe_size() << std::endl;
+    ret_type v;
+    if (q.try_pop(v)) {
+      std::cout << "got data to send: " << v << std::endl;
+      funnel_body(v);
+    }
+  }
+}
+
+template <typename InputRange, typename Body, typename Body2>
+void forall_mpi_progress(InputRange &&it, Body &&b, Body2 &&funnel_body)
+{
+  // queue of return type of b
+  using ret_type = typename std::result_of<Body(decltype(*it.begin()))>::type;
+  tbb::concurrent_queue<ret_type> q;
+#pragma omp parallel
+#pragma omp master
+  {
+    int indices[10];
+    MPI_Status statuses[10];
+    while (it.done < it.size()) {
+      int cnt = it.try_some(indices, statuses);
+      for (int i = 0; i < cnt; ++i) {
+#pragma omp task
+        {
+          int &idx = indices[i];
+          q.emplace(b({&it.requests[idx], idx}));
+        }
+      }
+      ret_type v;
+      // must process here, just in case we're serialized
+      while (q.try_pop(v)) {
+
+#pragma omp critical
+        std::cout << "got data to send: " << v << std::endl;
+        funnel_body(v);
+        // do everything we can to ensure deadlock avoidance
+#pragma omp taskyield
+      }
+    }
+  }
+  // all receives are done at this point
+  while (!q.empty()) {
+    std::cout << "draining queue " << q.unsafe_size() << std::endl;
+    ret_type v;
+    if (q.try_pop(v)) {
+      std::cout << "got data to send: " << v << std::endl;
+      funnel_body(v);
+    }
+  }
+}
+
 using namespace Kripke;
 
 /**
@@ -55,13 +258,7 @@ void Kripke::SweepSolver (Kripke::Core::DataStore &data_store, std::vector<SdomI
   Kripke::Kernel::kConst(data_store.getVariable<Field_KPlane>("k_plane"), 0.0);
 
   // Create a new sweep communicator object
-  ParallelComm *comm = NULL;
-  if(block_jacobi){
-    comm = new BlockJacobiComm(data_store);
-  }
-  else {
-    comm = new SweepComm(data_store);
-  }
+  SweepComm *comm = comm = new SweepComm(data_store);
 
   // Add all subdomains in our list
   for(size_t i = 0;i < subdomain_list.size();++ i){
@@ -74,6 +271,8 @@ void Kripke::SweepSolver (Kripke::Core::DataStore &data_store, std::vector<SdomI
   auto &field_upwind = data_store.getVariable<Field_Adjacency>("upwind");
 
   /* Loop until we have finished all of our work */
+#pragma omp parallel
+#pragma omp master
   while(comm->workRemaining()){
 
     std::vector<SdomId> sdom_ready = comm->readySubdomains();
@@ -81,26 +280,30 @@ void Kripke::SweepSolver (Kripke::Core::DataStore &data_store, std::vector<SdomI
 
     // Run top of list
     if(backlog > 0){
-      SdomId sdom_id = sdom_ready[0];
+#pragma omp task
+      {
+        SdomId sdom_id = sdom_ready[0];
 
-      auto upwind = field_upwind.getView(sdom_id);
+        auto upwind = field_upwind.getView(sdom_id);
 
-      // Clear boundary conditions
-      if(upwind(Direction{0}) == -1){
-        Kripke::Kernel::kConst(data_store.getVariable<Field_IPlane>("i_plane"), sdom_id, 0.0);
+        // Clear boundary conditions
+        if(upwind(Direction{0}) == -1){
+          Kripke::Kernel::kConst(data_store.getVariable<Field_IPlane>("i_plane"), sdom_id, 0.0);
+        }
+        if(upwind(Direction{1}) == -1){
+          Kripke::Kernel::kConst(data_store.getVariable<Field_JPlane>("j_plane"), sdom_id, 0.0);
+        }
+        if(upwind(Direction{2}) == -1){
+          Kripke::Kernel::kConst(data_store.getVariable<Field_KPlane>("k_plane"), sdom_id, 0.0);
+        }
+
+        // Perform subdomain sweep
+        Kripke::Kernel::sweepSubdomain(data_store, Kripke::SdomId{sdom_id});
+
+        // Mark as complete (and do any communication)
+#pragma omp critical
+        comm->markComplete(sdom_id);
       }
-      if(upwind(Direction{1}) == -1){
-        Kripke::Kernel::kConst(data_store.getVariable<Field_JPlane>("j_plane"), sdom_id, 0.0);
-      }
-      if(upwind(Direction{2}) == -1){
-        Kripke::Kernel::kConst(data_store.getVariable<Field_KPlane>("k_plane"), sdom_id, 0.0);
-      }
-
-      // Perform subdomain sweep
-      Kripke::Kernel::sweepSubdomain(data_store, Kripke::SdomId{sdom_id});
-
-      // Mark as complete (and do any communication)
-      comm->markComplete(sdom_id);
     }
   }
 
