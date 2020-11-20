@@ -69,7 +69,11 @@ option(ENABLE_CHAI "Enable CHAI/Umpire memory management" Off)
 if(ENABLE_CHAI)
   if (DEFINED umpire_DIR)
     find_package(umpire REQUIRED)
-    
+  else()
+    find_package(umpire)
+  endif()
+
+  if (umpire_FOUND)
     if (ENABLE_MPI)
       set(UMPIRE_DEPENDS mpi)
     else()
@@ -85,26 +89,13 @@ if(ENABLE_CHAI)
     add_subdirectory(tpl/umpire)
   endif()
 
-    # Umpire depends on camp
-    #  if (NOT TARGET camp)
-    #    if (DEFINED camp_DIR)
-    #      find_package(camp REQUIRED)
-    #      set_target_properties(camp PROPERTIES IMPORTED_GLOBAL TRUE)
-    #    else ()
-    #      message(FATAL_ERROR "camp is required. Please set camp_DIR")
-    #    endif()
-    #
-    #    if(ENABLE_CUDA)
-    #      blt_add_target_definitions(
-    #        TO camp
-    #        SCOPE INTERFACE
-    #        TARGET_DEFINITIONS CAMP_HAVE_CUDA)
-    #    endif()
-    #  endif ()
-
   if (DEFINED chai_DIR)
     find_package(chai REQUIRED)
-  else ()
+  else()
+    find_package(chai)
+  endif()
+
+  if (NOT chai_FOUND)
     add_subdirectory(tpl/chai)
   endif ()
 
@@ -118,11 +109,13 @@ endif()
 #
 if (DEFINED camp_DIR)
   find_package(camp REQUIRED)
-else ()
+else()
+  find_package(camp)
+endif()
+if (NOT camp_FOUND)
   add_subdirectory(tpl/camp)
 endif ()
 list(APPEND KRIPKE_DEPENDS camp)
-
 
 
 #
@@ -131,6 +124,9 @@ list(APPEND KRIPKE_DEPENDS camp)
 if (DEFINED RAJA_DIR)
   find_package(RAJA REQUIRED)
 else ()
+  find_package(RAJA)
+endif()
+if(NOT RAJA_FOUND)
   set(ENABLE_EXAMPLES Off CACHE Bool "")
   set(ENABLE_EXERCISES Off CACHE Bool "")
   add_subdirectory(tpl/raja)
